@@ -1,7 +1,9 @@
 
-const HEADERS = {
+const JSON_HEADERS = {
   "content-type": "application/json; charset=utf-8"
 };
+
+const CF_API = "https://api.cloudflare.com/client/v4";
 
 function cors(origin) {
   return {
@@ -17,13 +19,34 @@ function reply(data, status, origin) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      ...HEADERS,
+      ...JSON_HEADERS,
       ...cors(origin)
     }
   });
 }
 
-// Verify the signed-in Supabase user.
+async function readJson(response) {
+  const text = await response.text();
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = null;
+  }
+
+  if (!response.ok || !data?.success) {
+    const message =
+      data?.errors?.map(e => e.message).filter(Boolean).join("; ") ||
+      `API request failed (${response.status}).`;
+
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+// Supabase user authentication.
 async function userFor(env, token) {
   const response = await fetch(
     `${env.SUPABASE_URL}/auth/v1/user`,
@@ -40,8 +63,8 @@ async function userFor(env, token) {
   return response.json();
 }
 
-// Server-side database requests.
-// Supabase sb_secret keys are sent through apikey only.
+// Supabase database access.
+// New sb_secret keys are used in apikey only.
 async function db(env, path, method = "GET", data) {
   return fetch(
     `${env.SUPABASE_URL}/rest/v1/${path}`,
@@ -59,31 +82,28 @@ async function db(env, path, method = "GET", data) {
   );
 }
 
-// Cloudflare API helper.
-async function cf(env, path, method = "GET", body, contentType) {
+// Cloudflare API request using the account API token.
+async function cf(env, path, method = "GET", body) {
   const headers = {
     Authorization: `Bearer ${env.CF_API_TOKEN}`
   };
 
-  if (contentType) {
-    headers["content-type"] = contentType;
+  if (body !== undefined && !(body instanceof FormData)) {
+    headers["content-type"] = "application/json";
   }
 
-  return fetch(
-    `https://api.cloudflare.com/client/v4${path}`,
-    {
-      method,
-      headers,
-      body: body
-        ? contentType
-          ? JSON.stringify(body)
-          : body
-        : undefined
-    }
-  );
+  return fetch(`${CF_API}${path}`, {
+    method,
+    headers,
+    body: body === undefined
+      ? undefined
+      : body instanceof FormData
+        ? body
+        : JSON.stringify(body)
+  });
 }
 
-// Generate a unique Cloudflare Pages project name.
+// Cloudflare Pages project name.
 function projectName(name, id) {
   const slug = String(name)
     .toLowerCase()
@@ -95,9 +115,9 @@ function projectName(name, id) {
   return `zfy-${slug}-${id.replace(/-/g, "").slice(0, 10)}`;
 }
 
-// Reject unsafe upload paths.
+// Validate website file paths.
 function safePath(path) {
-  return (
+  return Boolean(
     path &&
     path.length <= 500 &&
     !path.startsWith("/") &&
@@ -112,7 +132,7 @@ function safePath(path) {
   );
 }
 
-// Calculate SHA-256 file hashes.
+// SHA-256 hash.
 async function hash(buffer) {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -124,7 +144,53 @@ async function hash(buffer) {
     .join("");
 }
 
-// Create a Pages project and save its name.
+// File MIME types.
+function mimeType(filename) {
+  const ext = filename.split(".").pop().toLowerCase();
+
+  const types = {
+    html: "text/html; charset=utf-8",
+    htm: "text/html; charset=utf-8",
+    css: "text/css; charset=utf-8",
+    js: "text/javascript; charset=utf-8",
+    mjs: "text/javascript; charset=utf-8",
+    json: "application/json",
+    xml: "application/xml",
+    txt: "text/plain; charset=utf-8",
+    svg: "image/svg+xml",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    ico: "image/x-icon",
+    pdf: "application/pdf",
+    woff: "font/woff",
+    woff2: "font/woff2",
+    ttf: "font/ttf",
+    otf: "font/otf",
+    mp4: "video/mp4",
+    mp3: "audio/mpeg",
+    webm: "video/webm"
+  };
+
+  return types[ext] || "application/octet-stream";
+}
+
+// Convert binary data to Base64 safely.
+function toBase64(bytes) {
+  let binary = "";
+  const chunkSize = 8192;
+
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+
+  return btoa(binary);
+}
+
+// Create or retrieve the Pages project.
 async function getOrCreatePagesProject(env, project) {
   if (project.cf_project_name) {
     return project.cf_project_name;
@@ -135,31 +201,43 @@ async function getOrCreatePagesProject(env, project) {
     project.id
   );
 
-  const path =
-    `/accounts/${env.CF_ACCOUNT_ID}/pages/projects/${name}`;
+  const base =
+    `/accounts/${env.CF_ACCOUNT_ID}/pages/projects`;
 
-  let response = await cf(
+  const createResponse = await cf(
     env,
-    `/accounts/${env.CF_ACCOUNT_ID}/pages/projects`,
+    base,
     "POST",
     {
       name,
       production_branch: "main"
-    },
-    "application/json"
+    }
   );
 
-  let result = await response.json();
+  if (!createResponse.ok) {
+    const existingResponse = await cf(
+      env,
+      `${base}/${name}`,
+      "GET"
+    );
 
-  // If the project already exists, retrieve it.
-  if (!response.ok || !result.success) {
-    const existing = await cf(env, path, "GET");
-    const existingResult = await existing.json();
+    const existing = await existingResponse.json();
 
-    if (!existing.ok || !existingResult.success) {
+    if (!existingResponse.ok || !existing.success) {
+      const failed = await createResponse.json();
+
       throw new Error(
-        result.errors?.[0]?.message ||
+        failed.errors?.[0]?.message ||
         "Could not create the Cloudflare Pages project."
+      );
+    }
+  } else {
+    const created = await createResponse.json();
+
+    if (!created.success) {
+      throw new Error(
+        created.errors?.[0]?.message ||
+        "Cloudflare rejected the Pages project."
       );
     }
   }
@@ -176,18 +254,49 @@ async function getOrCreatePagesProject(env, project) {
   );
 
   if (!saved.ok) {
-    throw new Error(
-      "Could not save the Cloudflare project information."
-    );
+    throw new Error("Could not save the Pages project.");
   }
 
   return name;
 }
 
-// Upload website files to Cloudflare Pages.
-async function deploy(env, name, files) {
+// Get a temporary token for Pages asset uploads.
+async function getUploadToken(env, name) {
+  const response = await cf(
+    env,
+    `/accounts/${env.CF_ACCOUNT_ID}/pages/projects/${name}/upload-token`
+  );
+
+  const data = await readJson(response);
+
+  if (!data.result?.jwt) {
+    throw new Error("Cloudflare did not provide an asset upload token.");
+  }
+
+  return data.result.jwt;
+}
+
+// Make an authenticated Pages asset API request.
+async function assetRequest(token, endpoint, body) {
+  const response = await fetch(
+    `${CF_API}/pages/assets/${endpoint}`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(body)
+    }
+  );
+
+  return readJson(response);
+}
+
+// Upload all website files using the proper Pages workflow.
+async function uploadAssets(token, files) {
   const manifest = {};
-  const parts = [];
+  const fileByHash = new Map();
 
   for (const file of files) {
     const buffer = await file.arrayBuffer();
@@ -195,13 +304,74 @@ async function deploy(env, name, files) {
 
     manifest[file.name] = fileHash;
 
-    parts.push({
-      hash: fileHash,
-      buffer,
-      name: file.name
-    });
+    if (!fileByHash.has(fileHash)) {
+      fileByHash.set(fileHash, {
+        hash: fileHash,
+        bytes: new Uint8Array(buffer),
+        contentType: mimeType(file.name)
+      });
+    }
   }
 
+  const allHashes = [...fileByHash.keys()];
+
+  // Step 1: Find missing assets.
+  const missingSet = new Set();
+
+  for (let i = 0; i < allHashes.length; i += 100) {
+    const batch = allHashes.slice(i, i + 100);
+
+    const checked = await assetRequest(
+      token,
+      "check-missing",
+      { hashes: batch }
+    );
+
+    for (const missingHash of checked.result || []) {
+      missingSet.add(missingHash);
+    }
+  }
+
+  // Step 2: Upload missing assets in small batches.
+  const missingFiles = [...missingSet].map(hashValue =>
+    fileByHash.get(hashValue)
+  ).filter(Boolean);
+
+  for (let i = 0; i < missingFiles.length; i += 5) {
+    const batch = missingFiles.slice(i, i + 5);
+
+    const payload = batch.map(file => ({
+      key: file.hash,
+      value: toBase64(file.bytes),
+      base64: true,
+      metadata: {
+        contentType: file.contentType
+      }
+    }));
+
+    await assetRequest(
+      token,
+      "upload",
+      payload
+    );
+  }
+
+  // Step 3: Register uploaded hashes.
+  for (let i = 0; i < allHashes.length; i += 100) {
+    const batch = allHashes.slice(i, i + 100);
+
+    await assetRequest(
+      token,
+      "upsert-hashes",
+      { hashes: batch }
+    );
+  }
+
+  return manifest;
+}
+
+// Create the production deployment.
+async function createDeployment(env, name, manifest) {
   const form = new FormData();
 
   form.set("manifest", JSON.stringify(manifest));
@@ -212,14 +382,6 @@ async function deploy(env, name, files) {
     "Published from Zapify Hosting"
   );
 
-  for (const part of parts) {
-    form.append(
-      part.hash,
-      new Blob([part.buffer]),
-      part.name
-    );
-  }
-
   const response = await cf(
     env,
     `/accounts/${env.CF_ACCOUNT_ID}/pages/projects/${name}/deployments`,
@@ -227,22 +389,15 @@ async function deploy(env, name, files) {
     form
   );
 
-  const result = await response.json();
+  const data = await readJson(response);
 
-  if (!response.ok || !result.success) {
-    throw new Error(
-      result.errors?.[0]?.message ||
-      "Cloudflare could not deploy your website."
-    );
+  if (!data.result?.id) {
+    throw new Error("Cloudflare did not return a deployment ID.");
   }
 
-  // Always use the permanent production hostname.
-  // Do not use the unique deployment URL.
-  const productionUrl = `https://${name}.pages.dev`;
-
   return {
-    deploymentId: result.result?.id || null,
-    url: productionUrl
+    id: data.result.id,
+    url: `https://${name}.pages.dev`
   };
 }
 
@@ -252,7 +407,7 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const allowedOrigin = env.ALLOWED_ORIGIN || "";
 
-    if (origin !== allowedOrigin || !allowedOrigin) {
+    if (!allowedOrigin || origin !== allowedOrigin) {
       return new Response("Origin not allowed", {
         status: 403
       });
@@ -278,8 +433,10 @@ export default {
       );
     }
 
+    let project = null;
+
     try {
-      // Check required environment variables.
+      // Required Cloudflare variables.
       const required = [
         "SUPABASE_URL",
         "SUPABASE_ANON_KEY",
@@ -290,9 +447,7 @@ export default {
 
       for (const key of required) {
         if (!env[key]) {
-          throw new Error(
-            `Missing Cloudflare configuration: ${key}`
-          );
+          throw new Error(`Missing configuration: ${key}`);
         }
       }
 
@@ -306,7 +461,7 @@ export default {
 
       if (!token) {
         return reply(
-          { error: "Please sign in to continue." },
+          { error: "Please sign in first." },
           401,
           origin
         );
@@ -316,15 +471,13 @@ export default {
 
       if (!user?.id) {
         return reply(
-          {
-            error: "Your session has expired. Please sign in again."
-          },
+          { error: "Your session expired. Please sign in again." },
           401,
           origin
         );
       }
 
-      // Read upload.
+      // Read upload form.
       const form = await request.formData();
 
       const siteName = String(
@@ -337,9 +490,7 @@ export default {
 
       if (!siteName || siteName.length > 60) {
         return reply(
-          {
-            error: "Enter a website name (maximum 60 characters)."
-          },
+          { error: "Website name must be 1–60 characters." },
           400,
           origin
         );
@@ -347,15 +498,13 @@ export default {
 
       if (!files.length || files.length > 100) {
         return reply(
-          {
-            error: "Upload between 1 and 100 files."
-          },
+          { error: "Upload between 1 and 100 files." },
           400,
           origin
         );
       }
 
-      // Validate files.
+      // Validate all files.
       let totalSize = 0;
       const paths = new Set();
 
@@ -382,9 +531,7 @@ export default {
 
       if (totalSize > 20 * 1024 * 1024) {
         return reply(
-          {
-            error: "Your expanded website exceeds 20 MiB."
-          },
+          { error: "Website files exceed 20 MiB." },
           413,
           origin
         );
@@ -392,15 +539,13 @@ export default {
 
       if (!paths.has("index.html")) {
         return reply(
-          {
-            error: "Your ZIP must contain index.html at its root."
-          },
+          { error: "Your ZIP must contain index.html at its root." },
           400,
           origin
         );
       }
 
-      // Create database record.
+      // Create the Supabase project record.
       const created = await db(
         env,
         "projects",
@@ -425,85 +570,93 @@ export default {
 
       if (!created.ok || !rows?.[0]) {
         console.error(
-          "Supabase project creation failed:",
+          "Supabase insert failed:",
           created.status,
           raw
         );
 
         throw new Error(
-          `Could not create project record (database status ${created.status}).`
+          `Could not create project record (database ${created.status}).`
         );
       }
 
-      const project = rows[0];
+      project = rows[0];
 
-      try {
-        // Create Pages project.
-        const name = await getOrCreatePagesProject(
-          env,
-          project
-        );
+      // Create or retrieve Pages project.
+      const name = await getOrCreatePagesProject(
+        env,
+        project
+      );
 
-        // Deploy website.
-        const deployment = await deploy(
-          env,
-          name,
-          files
-        );
+      // Get temporary asset upload token.
+      const uploadToken = await getUploadToken(
+        env,
+        name
+      );
 
-        // Save permanent website URL.
-        const saved = await db(
-          env,
-          `projects?id=eq.${project.id}&user_id=eq.${user.id}`,
-          "PATCH",
-          {
-            cf_deployment_id: deployment.deploymentId,
-            live_url: deployment.url,
-            status: "published",
-            updated_at: new Date().toISOString()
-          }
-        );
+      // Upload actual website assets.
+      const manifest = await uploadAssets(
+        uploadToken,
+        files
+      );
 
-        if (!saved.ok) {
-          throw new Error(
-            "Website deployed, but its status could not be saved."
-          );
+      // Create the real production deployment.
+      const deployment = await createDeployment(
+        env,
+        name,
+        manifest
+      );
+
+      // Save published website information.
+      const saved = await db(
+        env,
+        `projects?id=eq.${project.id}&user_id=eq.${user.id}`,
+        "PATCH",
+        {
+          cf_deployment_id: deployment.id,
+          live_url: deployment.url,
+          status: "published",
+          updated_at: new Date().toISOString()
         }
+      );
 
-        return reply(
-          {
-            success: true,
-            message: "Your website has been published successfully.",
-            projectId: project.id,
-            url: deployment.url
-          },
-          200,
-          origin
+      if (!saved.ok) {
+        throw new Error(
+          "Website deployed, but database status could not be updated."
         );
+      }
 
-      } catch (error) {
+      return reply(
+        {
+          success: true,
+          message: "Website published successfully.",
+          projectId: project.id,
+          url: deployment.url
+        },
+        200,
+        origin
+      );
+
+    } catch (error) {
+      console.error("Zapify Hosting error:", error);
+
+      // Mark failed projects accurately.
+      if (project?.id) {
         await db(
           env,
-          `projects?id=eq.${project.id}&user_id=eq.${user.id}`,
+          `projects?id=eq.${project.id}&user_id=eq.${project.user_id}`,
           "PATCH",
           {
             status: "failed",
             updated_at: new Date().toISOString()
           }
-        );
-
-        throw error;
+        ).catch(() => {});
       }
-
-    } catch (error) {
-      console.error(
-        "Zapify Hosting deployment error:",
-        error
-      );
 
       return reply(
         {
-          error: error.message || "An unexpected deployment error occurred."
+          error: error.message ||
+            "An unexpected deployment error occurred."
         },
         500,
         origin
