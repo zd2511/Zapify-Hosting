@@ -1,0 +1,7 @@
+name = "zapify-hosting-api"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+[vars]
+# Change to your exact frontend origin, without a trailing slash.
+ALLOWED_ORIGIN = "https://YOUR-FRONTEND.pages.dev"
+# Add secrets with `npx wrangler secret put SECRET_NAME`.
