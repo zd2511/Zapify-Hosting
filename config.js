@@ -3,5 +3,5 @@
 window.ZAPIFY_CONFIG = {
   supabaseUrl: "https://levijzefvecapnkjbmdn.supabase.co",
   supabaseAnonKey: "sb_publishable_JC9FK57jfJu2FCYkvpawGA_aSHSiEK0",
-  apiBaseUrl: "YOUR_CLOUDFLARE_WORKER_URL"
+  apiBaseUrl: "https://zapify-hosting.zapifydesigns.workers.co.za"
 };
