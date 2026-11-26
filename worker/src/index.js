@@ -2,7 +2,19 @@ const HEADERS={"content-type":"application/json; charset=utf-8"};
 const cors=o=>({"access-control-allow-origin":o,"access-control-allow-methods":"POST, OPTIONS","access-control-allow-headers":"Authorization, Content-Type","vary":"Origin"});
 const reply=(data,status,origin)=>new Response(JSON.stringify(data),{status,headers:{...HEADERS,...cors(origin)}});
 async function userFor(env,token){const r=await fetch(`${env.SUPABASE_URL}/auth/v1/user`,{headers:{apikey:env.SUPABASE_ANON_KEY,Authorization:`Bearer ${token}`}});return r.ok?r.json():null}
-async function db(env,path,method='GET',data){return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`,{method,headers:{apikey:env.SUPABASE_SERVICE_ROLE_KEY,Authorization:`Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,'content-type':'application/json',Prefer:method==='POST'?'return=representation':'return=minimal'},body:data?JSON.stringify(data):undefined})}
+
+async function db(env,path,method='GET',data){
+  return fetch(`${env.SUPABASE_URL}/rest/v1/${path}`,{
+    method,
+    headers:{
+      apikey:env.SUPABASE_SERVICE_ROLE_KEY,
+      'content-type':'application/json',
+      Prefer:method==='POST'?'return=representation':'return=minimal'
+    },
+    body:data?JSON.stringify(data):undefined
+  });
+}
+
 async function cf(env,path,method='GET',body,contentType){const h={Authorization:`Bearer ${env.CF_API_TOKEN}`};if(contentType)h['content-type']=contentType;return fetch(`https://api.cloudflare.com/client/v4${path}`,{method,headers:h,body:body?(contentType?JSON.stringify(body):body):undefined})}
 function projectName(name,id){const slug=String(name).toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,22)||'site';return `zfy-${slug}-${id.replace(/-/g,'').slice(0,10)}`.slice(0,58)}
 function safePath(p){return p&&p.length<=500&&!p.startsWith('/')&&!p.includes('\\')&&!p.includes('\0')&&p.split('/').every(x=>x&&x!=='.'&&x!=='..'&&!x.startsWith('.'))}
